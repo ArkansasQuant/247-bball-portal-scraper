@@ -1,0 +1,56 @@
+name: Scrape 247 Basketball Transfer Portal
+
+on:
+  workflow_dispatch:
+    inputs:
+      player_count:
+        description: 'Number of players to scrape'
+        required: true
+        default: '10'
+        type: choice
+        options:
+          - '10'
+          - '25'
+          - '50'
+          - '100'
+          - '250'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Run scraper
+        run: python scrape_247_bball_portal.py ${{ inputs.player_count }}
+
+      - name: Upload CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: transfer-portal-csv
+          path: transfer_portal_top_250.csv
+          retention-days: 30
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics
+          path: |
+            diag_player_elements.json
+            diag_full_page.html
+            diag_screenshot.png
+          if-no-files-found: ignore
+          retention-days: 7
