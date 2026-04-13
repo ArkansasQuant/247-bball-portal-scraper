@@ -52,5 +52,6 @@ jobs:
             diag_player_elements.json
             diag_full_page.html
             diag_screenshot.png
+            diag_first_profile_timeline.html
           if-no-files-found: ignore
           retention-days: 7
