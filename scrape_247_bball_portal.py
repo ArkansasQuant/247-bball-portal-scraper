@@ -1,12 +1,9 @@
 """
-247Sports 2025 Basketball Transfer Portal Top 250 Scraper
+247Sports College Basketball Transfer Portal Scraper
+Supports 2023-2026 class years.
 Phase 1: Scroll-load players from rankings page using li.transfer-player elements.
 Phase 2: Visit each player profile, parse script#timelineJson for dates.
          Falls back to DOM parsing if JSON not found.
-
-The timeline data lives in a server-rendered <script id="timelineJson"> tag
-that the React component reads to render the visible timeline. Parsing it
-directly avoids all lazy-load/render timing issues.
 """
 
 import asyncio
@@ -17,7 +14,15 @@ import sys
 from playwright.async_api import async_playwright
 
 
-async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_top_250.csv"):
+async def scrape_transfer_portal(class_year=2025, target_count=250,
+                                  output_file=None):
+    if output_file is None:
+        output_file = f"transfer_portal_top_{class_year}.csv"
+
+    # For a given class year, portal entries + commits can span two calendar years
+    # e.g. 2025 class: portal entries from ~Mar 2024 - May 2025, commits through ~Jun 2025
+    valid_years = [str(class_year), str(class_year - 1)]
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -28,8 +33,9 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
         page = await context.new_page()
 
         # ── PHASE 1: Load rankings page ──
-        url = "https://247sports.com/season/2025-basketball/TransferPortalTop/"
+        url = f"https://247sports.com/season/{class_year}-basketball/TransferPortalTop/"
         print(f"[Phase 1] Navigating to {url}")
+        print(f"[Config] Class year: {class_year}, valid date years: {valid_years}, target: {target_count}")
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(5000)
 
@@ -115,8 +121,12 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
                 const bioEl = li.querySelector('div.bio');
                 let height = '', weight = '';
                 if (bioEl) {
-                    const m = bioEl.textContent.match(/(\\d+-\\d+)\\s*\\/\\s*(\\d+)/);
-                    if (m) { height = m[1]; weight = m[2]; }
+                    const m = bioEl.textContent.match(/(\\d+)-(\\d+)\\s*\\/\\s*(\\d+)/);
+                    if (m) {
+                        // Output as 6'9 to prevent Excel date interpretation
+                        height = m[1] + "'" + m[2];
+                        weight = m[3];
+                    }
                 }
 
                 const starContainer = li.querySelector('div.starContainer');
@@ -180,7 +190,7 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
                     await page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
                     await page.wait_for_timeout(2000)
 
-                    # Debug: dump timelineJson content for first profile
+                    # Debug first profile
                     if save_debug:
                         save_debug = False
                         debug_info = await page.evaluate("""
@@ -189,22 +199,36 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
                             if (script) {
                                 return 'FOUND script#timelineJson: ' + script.textContent.substring(0, 5000);
                             }
-                            // Check for other script tags with timeline data
                             const allScripts = document.querySelectorAll('script[id]');
                             const ids = Array.from(allScripts).map(s => s.id);
-                            return 'NO script#timelineJson. Script IDs on page: ' + ids.join(', ');
+                            return 'NO script#timelineJson. Script IDs: ' + ids.join(', ');
                         }
                         """)
                         with open("diag_first_profile_timeline.html", "w") as f:
                             f.write(debug_info)
                         print(f"\n    [Debug] Saved ({len(debug_info)} chars)")
 
-                    # ── PRIMARY: Parse script#timelineJson ──
+                    # ── Extract dates: JSON primary, DOM fallback ──
                     dates = await page.evaluate("""
-                    () => {
+                    (validYears) => {
                         let portalEntry = '';
                         let commitDate = '';
                         let method = '';
+
+                        const cleanDate = (d) => {
+                            if (!d) return '';
+                            const m = d.match(/([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4})/);
+                            if (m) return m[1];
+                            try {
+                                const dt = new Date(d);
+                                if (!isNaN(dt)) {
+                                    const months = ['Jan','Feb','Mar','Apr','May','Jun',
+                                                  'Jul','Aug','Sep','Oct','Nov','Dec'];
+                                    return months[dt.getMonth()] + ' ' + dt.getDate() + ', ' + dt.getFullYear();
+                                }
+                            } catch(e) {}
+                            return d;
+                        };
 
                         // === METHOD 1: Parse script#timelineJson ===
                         const script = document.querySelector('script#timelineJson');
@@ -213,46 +237,57 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
                                 const data = JSON.parse(script.textContent);
                                 method = 'json';
 
-                                // data could be an array of timeline events or have a nested structure
-                                // Each event likely has: date/Date, description/Description, year, type, etc.
-                                // We need to find events from 2025 with "entered the transfer portal" and "commits to"
-
-                                const events = Array.isArray(data) ? data : (data.Events || data.events || data.items || []);
-
-                                // If it's an object with year keys
                                 let flatEvents = [];
-                                if (Array.isArray(events)) {
-                                    flatEvents = events;
+                                if (Array.isArray(data)) {
+                                    flatEvents = data;
                                 } else if (typeof data === 'object') {
-                                    // Try to find arrays within the object
-                                    for (const key of Object.keys(data)) {
-                                        if (Array.isArray(data[key])) {
-                                            flatEvents = flatEvents.concat(data[key]);
+                                    // Try common nested structures
+                                    if (data.Events) flatEvents = data.Events;
+                                    else if (data.events) flatEvents = data.events;
+                                    else if (data.items) flatEvents = data.items;
+                                    else if (data.TimelineEvents) flatEvents = data.TimelineEvents;
+                                    else {
+                                        // Flatten all arrays in the object
+                                        for (const key of Object.keys(data)) {
+                                            if (Array.isArray(data[key])) {
+                                                flatEvents = flatEvents.concat(data[key]);
+                                            }
                                         }
                                     }
                                 }
 
                                 method += '_events=' + flatEvents.length;
 
+                                // Log first event structure for debugging
+                                if (flatEvents.length > 0) {
+                                    method += '_keys=' + Object.keys(flatEvents[0]).join('|');
+                                }
+
                                 for (const evt of flatEvents) {
-                                    // Try multiple possible field names
                                     const desc = (evt.Description || evt.description || evt.headline ||
-                                                  evt.title || evt.Title || evt.text || '').toLowerCase();
+                                                  evt.title || evt.Title || evt.text ||
+                                                  evt.Headline || evt.Action || evt.action || '').toLowerCase();
+
                                     const dateStr = evt.DateString || evt.dateString || evt.Date ||
-                                                    evt.date || evt.FormattedDate || evt.formattedDate || '';
-                                    const year = evt.Year || evt.year || '';
+                                                    evt.date || evt.FormattedDate || evt.formattedDate ||
+                                                    evt.EventDate || evt.eventDate || '';
 
-                                    // Filter to 2025
-                                    const isYear2025 = (String(year) === '2025') ||
-                                                       dateStr.includes('2025') ||
-                                                       (dateStr.match && dateStr.match(/,\\s*2025/));
+                                    const year = String(evt.Year || evt.year || '');
 
-                                    if (!isYear2025) continue;
+                                    // Check if this event is in valid years for this class
+                                    let isValidYear = false;
+                                    for (const vy of validYears) {
+                                        if (year === vy || dateStr.includes(vy)) {
+                                            isValidYear = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!isValidYear) continue;
 
                                     if (!portalEntry &&
                                         (desc.includes('entered the transfer portal') ||
                                          desc.includes('enters the transfer portal'))) {
-                                        portalEntry = dateStr;
+                                        portalEntry = cleanDate(dateStr);
                                     }
 
                                     if (!commitDate &&
@@ -261,88 +296,74 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
                                          desc.includes('signs with') ||
                                          desc.includes('enrolls at') ||
                                          desc.includes('transfers to'))) {
-                                        commitDate = dateStr;
+                                        commitDate = cleanDate(dateStr);
                                     }
 
                                     if (portalEntry && commitDate) break;
                                 }
-
-                                // If we found dates from JSON, clean them up
-                                // They might be in various formats, normalize to "Mon DD, YYYY"
-                                const cleanDate = (d) => {
-                                    if (!d) return '';
-                                    // Already in good format?
-                                    const m = d.match(/([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4})/);
-                                    if (m) return m[1];
-                                    // Try parsing ISO date
-                                    try {
-                                        const dt = new Date(d);
-                                        if (!isNaN(dt)) {
-                                            const months = ['Jan','Feb','Mar','Apr','May','Jun',
-                                                          'Jul','Aug','Sep','Oct','Nov','Dec'];
-                                            return months[dt.getMonth()] + ' ' + dt.getDate() + ', ' + dt.getFullYear();
-                                        }
-                                    } catch(e) {}
-                                    return d;
-                                };
-                                portalEntry = cleanDate(portalEntry);
-                                commitDate = cleanDate(commitDate);
-
                             } catch(e) {
-                                method = 'json_parse_error: ' + e.message;
+                                method = 'json_error:' + e.message.substring(0, 50);
                             }
                         }
 
-                        // === METHOD 2 FALLBACK: DOM-based, 2025 year section ===
+                        // === METHOD 2 FALLBACK: DOM 2025 year section ===
                         if (!portalEntry || !commitDate) {
-                            // Scroll to trigger timeline render
+                            // Scroll to trigger lazy-load
+                            window.scrollTo(0, document.body.scrollHeight);
+
                             const timelineBody = document.querySelector('.timeline-body');
                             if (timelineBody) {
                                 const yearHeaders = timelineBody.querySelectorAll(':scope > h4');
-                                let targetTimeline = null;
-                                for (const h4 of yearHeaders) {
-                                    if (h4.textContent.trim() === '2025') {
-                                        targetTimeline = h4.nextElementSibling;
-                                        break;
-                                    }
-                                }
-                                if (targetTimeline) {
-                                    const elements = targetTimeline.querySelectorAll(
+
+                                for (const yearH4 of yearHeaders) {
+                                    const yearText = yearH4.textContent.trim();
+                                    if (!validYears.includes(yearText)) continue;
+
+                                    const timeline = yearH4.nextElementSibling;
+                                    if (!timeline) continue;
+
+                                    const elements = timeline.querySelectorAll(
                                         '[class*="vertical-timeline-element"]'
                                     );
                                     for (const el of elements) {
                                         const h3 = el.querySelector('h3');
-                                        const h4 = el.querySelector('h4');
-                                        if (!h3 || !h4) continue;
+                                        const h4el = el.querySelector('h4');
+                                        if (!h3 || !h4el) continue;
                                         const h3Text = h3.textContent.trim();
-                                        const h4Text = h4.textContent.trim().toLowerCase();
+                                        const h4Text = h4el.textContent.trim().toLowerCase();
                                         const dateMatch = h3Text.match(/([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4})/);
                                         if (!dateMatch) continue;
                                         const dateStr = dateMatch[1];
-                                        if (!portalEntry && h4Text.includes('entered the transfer portal'))
+                                        if (!portalEntry &&
+                                            (h4Text.includes('entered the transfer portal') ||
+                                             h4Text.includes('enters the transfer portal')))
                                             portalEntry = dateStr;
-                                        if (!commitDate && (h4Text.includes('commits to') || h4Text.includes('enrolls at')))
+                                        if (!commitDate &&
+                                            (h4Text.includes('commits to') ||
+                                             h4Text.includes('enrolls at') ||
+                                             h4Text.includes('transfers to')))
                                             commitDate = dateStr;
                                         if (portalEntry && commitDate) break;
                                     }
-                                    method += '+dom_2025';
+                                    if (portalEntry && commitDate) break;
                                 }
+                                method += '+dom';
                             } else {
-                                method += '+no_timeline_body';
+                                method += '+no_dom';
                             }
                         }
 
-                        if (!method) method = 'no_script_no_dom';
+                        if (!method) method = 'nothing_found';
                         return { portalEntry, commitDate, method };
                     }
-                    """)
+                    """, valid_years)
 
                     player["portalEntryDate"] = dates.get("portalEntry", "")
                     player["commitDate"] = dates.get("commitDate", "")
 
                     pe = player['portalEntryDate'] or 'MISS'
                     cd = player['commitDate'] or 'MISS'
-                    extra = f" | {dates.get('method','')}" if i < 10 else ""
+                    extra = f" | {dates.get('method','')}" if i < 15 else ""
                     print(f"portal={pe} | commit={cd}{extra}")
                     break
 
@@ -370,18 +391,25 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
         print(f"[QA] Portal entry date: {has_portal}/{total_players} ({100*has_portal/max(total_players,1):.0f}%)")
         print(f"[QA] Commit date: {has_commit}/{total_players} ({100*has_commit/max(total_players,1):.0f}%)")
         print(f"[QA] Both dates: {has_both}/{total_players}")
-        missing = [p['name'] for p in players if not p.get("portalEntryDate")][:10]
+        missing = [p['name'] for p in players if not p.get("portalEntryDate")][:15]
         if missing:
-            print(f"[QA] Missing portal date (first 10): {', '.join(missing)}")
+            print(f"[QA] Missing portal date (first 15): {', '.join(missing)}")
+        missing_c = [p['name'] for p in players if not p.get("commitDate")][:15]
+        if missing_c:
+            print(f"[QA] Missing commit date (first 15): {', '.join(missing_c)}")
 
         # ── CSV ──
+        prev_season = f"{class_year - 1}/{str(class_year)[-2:]}"
+        next_season = f"{class_year}/{str(class_year + 1)[-2:]}"
+
         print(f"\n[Output] Writing {len(players)} rows to {output_file}")
         with open(output_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
                 "Rank", "Player Name", "Position", "Height", "Weight",
                 "Stars", "247 Transfer Rating", "Portal Entry Date",
-                "Commit Date", "24/25 Team", "25/26 Team", "Profile URL"
+                "Commit Date", f"{prev_season} Team", f"{next_season} Team",
+                "Profile URL"
             ])
             for p in players:
                 writer.writerow([
@@ -397,5 +425,12 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
 
 
 if __name__ == "__main__":
-    target = int(sys.argv[1]) if len(sys.argv) > 1 else 250
-    asyncio.run(scrape_transfer_portal(target_count=target))
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("player_count", type=int, nargs="?", default=250)
+    parser.add_argument("--year", type=int, default=2025)
+    args = parser.parse_args()
+    asyncio.run(scrape_transfer_portal(
+        class_year=args.year,
+        target_count=args.player_count
+    ))
