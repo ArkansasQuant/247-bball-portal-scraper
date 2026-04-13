@@ -1,25 +1,12 @@
 """
 247Sports 2025 Basketball Transfer Portal Top 250 Scraper
 Phase 1: Scroll-load players from rankings page using li.transfer-player elements.
-Phase 2: Visit each player profile, wait for section.timeline to load,
-         extract portal entry + commit dates from the 2025 year section only.
+Phase 2: Visit each player profile, parse script#timelineJson for dates.
+         Falls back to DOM parsing if JSON not found.
 
-Timeline DOM structure (from browser inspection):
-  section.timeline
-    div#timeline
-    div.timeline-body
-      h4  "2026"                          (year header - direct child of timeline-body)
-      div.vertical-timeline              (events for 2026)
-      h4  "2025"                          (year header)
-      div.vertical-timeline              (events for 2025 - THIS IS WHAT WE WANT)
-        div.vertical-timeline-element
-          h3  "Mar 31, 2025: Transfer"   (date + type)
-          h4  "Player entered the transfer portal"  (description)
-        div.vertical-timeline-element
-          h3  "Apr 5, 2025: Transfer"
-          h4  "Player commits to Michigan Wolverines"
-      h4  "2023"
-      div.vertical-timeline              (events for 2023 - skip)
+The timeline data lives in a server-rendered <script id="timelineJson"> tag
+that the React component reads to render the visible timeline. Parsing it
+directly avoids all lazy-load/render timing issues.
 """
 
 import asyncio
@@ -193,146 +180,160 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
                     await page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
                     await page.wait_for_timeout(2000)
 
-                    # Full scroll to bottom to trigger lazy-load of timeline
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(2000)
-
-                    # Wait for section.timeline to appear
-                    timeline_loaded = False
-                    try:
-                        await page.wait_for_selector("section.timeline", timeout=6000)
-                        timeline_loaded = True
-                    except:
-                        # Retry: scroll top then bottom again
-                        await page.evaluate("window.scrollTo(0, 0)")
-                        await page.wait_for_timeout(500)
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        await page.wait_for_timeout(3000)
-                        try:
-                            await page.wait_for_selector("section.timeline", timeout=5000)
-                            timeline_loaded = True
-                        except:
-                            pass
-
-                    if not timeline_loaded:
-                        # Last resort: step-scroll
-                        height = await page.evaluate("() => document.body.scrollHeight")
-                        for y in range(0, height, 400):
-                            await page.evaluate(f"window.scrollTo(0, {y})")
-                            await page.wait_for_timeout(250)
-                        await page.wait_for_timeout(2000)
-                        try:
-                            await page.wait_for_selector("section.timeline", timeout=3000)
-                            timeline_loaded = True
-                        except:
-                            pass
-
-                    # Expand "See all X entries"
-                    if timeline_loaded:
-                        try:
-                            see_all = page.locator(
-                                "a:has-text('See all'), a:has-text('Load more')"
-                            ).first
-                            if await see_all.is_visible(timeout=1500):
-                                await see_all.click()
-                                await page.wait_for_timeout(2000)
-                        except:
-                            pass
-
-                    # Debug first profile
+                    # Debug: dump timelineJson content for first profile
                     if save_debug:
                         save_debug = False
                         debug_info = await page.evaluate("""
                         () => {
-                            const section = document.querySelector('section.timeline');
-                            if (!section) return 'NO section.timeline found on page';
-                            const body = section.querySelector('.timeline-body');
-                            if (!body) return 'section.timeline exists but no .timeline-body child';
-                            const yearH4s = body.querySelectorAll(':scope > h4');
-                            const years = Array.from(yearH4s).map(h => h.textContent.trim());
-                            const allElems = section.querySelectorAll('[class*="vertical-timeline-element"]');
-                            return JSON.stringify({
-                                years: years,
-                                totalTimelineElements: allElems.length,
-                                bodySnippet: body.innerHTML.substring(0, 3000)
-                            }, null, 2);
+                            const script = document.querySelector('script#timelineJson');
+                            if (script) {
+                                return 'FOUND script#timelineJson: ' + script.textContent.substring(0, 5000);
+                            }
+                            // Check for other script tags with timeline data
+                            const allScripts = document.querySelectorAll('script[id]');
+                            const ids = Array.from(allScripts).map(s => s.id);
+                            return 'NO script#timelineJson. Script IDs on page: ' + ids.join(', ');
                         }
                         """)
                         with open("diag_first_profile_timeline.html", "w") as f:
                             f.write(debug_info)
-                        print(f"\n    [Debug] Saved profile debug ({len(debug_info)} chars)")
+                        print(f"\n    [Debug] Saved ({len(debug_info)} chars)")
 
-                    # ── Extract dates from 2025 year section ONLY ──
+                    # ── PRIMARY: Parse script#timelineJson ──
                     dates = await page.evaluate("""
                     () => {
                         let portalEntry = '';
                         let commitDate = '';
+                        let method = '';
 
-                        const timelineBody = document.querySelector('.timeline-body');
-                        if (!timelineBody) {
-                            return { portalEntry: '', commitDate: '', debug: 'no timeline-body' };
-                        }
+                        // === METHOD 1: Parse script#timelineJson ===
+                        const script = document.querySelector('script#timelineJson');
+                        if (script) {
+                            try {
+                                const data = JSON.parse(script.textContent);
+                                method = 'json';
 
-                        // Find year headers (direct child h4 of timeline-body)
-                        const yearHeaders = timelineBody.querySelectorAll(':scope > h4');
-                        let targetTimeline = null;
-                        const allYears = Array.from(yearHeaders).map(h => h.textContent.trim());
+                                // data could be an array of timeline events or have a nested structure
+                                // Each event likely has: date/Date, description/Description, year, type, etc.
+                                // We need to find events from 2025 with "entered the transfer portal" and "commits to"
 
-                        for (const h4 of yearHeaders) {
-                            if (h4.textContent.trim() === '2025') {
-                                targetTimeline = h4.nextElementSibling;
-                                break;
+                                const events = Array.isArray(data) ? data : (data.Events || data.events || data.items || []);
+
+                                // If it's an object with year keys
+                                let flatEvents = [];
+                                if (Array.isArray(events)) {
+                                    flatEvents = events;
+                                } else if (typeof data === 'object') {
+                                    // Try to find arrays within the object
+                                    for (const key of Object.keys(data)) {
+                                        if (Array.isArray(data[key])) {
+                                            flatEvents = flatEvents.concat(data[key]);
+                                        }
+                                    }
+                                }
+
+                                method += '_events=' + flatEvents.length;
+
+                                for (const evt of flatEvents) {
+                                    // Try multiple possible field names
+                                    const desc = (evt.Description || evt.description || evt.headline ||
+                                                  evt.title || evt.Title || evt.text || '').toLowerCase();
+                                    const dateStr = evt.DateString || evt.dateString || evt.Date ||
+                                                    evt.date || evt.FormattedDate || evt.formattedDate || '';
+                                    const year = evt.Year || evt.year || '';
+
+                                    // Filter to 2025
+                                    const isYear2025 = (String(year) === '2025') ||
+                                                       dateStr.includes('2025') ||
+                                                       (dateStr.match && dateStr.match(/,\\s*2025/));
+
+                                    if (!isYear2025) continue;
+
+                                    if (!portalEntry &&
+                                        (desc.includes('entered the transfer portal') ||
+                                         desc.includes('enters the transfer portal'))) {
+                                        portalEntry = dateStr;
+                                    }
+
+                                    if (!commitDate &&
+                                        (desc.includes('commits to') ||
+                                         desc.includes('committed to') ||
+                                         desc.includes('signs with') ||
+                                         desc.includes('enrolls at') ||
+                                         desc.includes('transfers to'))) {
+                                        commitDate = dateStr;
+                                    }
+
+                                    if (portalEntry && commitDate) break;
+                                }
+
+                                // If we found dates from JSON, clean them up
+                                // They might be in various formats, normalize to "Mon DD, YYYY"
+                                const cleanDate = (d) => {
+                                    if (!d) return '';
+                                    // Already in good format?
+                                    const m = d.match(/([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4})/);
+                                    if (m) return m[1];
+                                    // Try parsing ISO date
+                                    try {
+                                        const dt = new Date(d);
+                                        if (!isNaN(dt)) {
+                                            const months = ['Jan','Feb','Mar','Apr','May','Jun',
+                                                          'Jul','Aug','Sep','Oct','Nov','Dec'];
+                                            return months[dt.getMonth()] + ' ' + dt.getDate() + ', ' + dt.getFullYear();
+                                        }
+                                    } catch(e) {}
+                                    return d;
+                                };
+                                portalEntry = cleanDate(portalEntry);
+                                commitDate = cleanDate(commitDate);
+
+                            } catch(e) {
+                                method = 'json_parse_error: ' + e.message;
                             }
                         }
 
-                        if (!targetTimeline) {
-                            return {
-                                portalEntry: '', commitDate: '',
-                                debug: 'years=[' + allYears.join(',') + '] no 2025 section'
-                            };
+                        // === METHOD 2 FALLBACK: DOM-based, 2025 year section ===
+                        if (!portalEntry || !commitDate) {
+                            // Scroll to trigger timeline render
+                            const timelineBody = document.querySelector('.timeline-body');
+                            if (timelineBody) {
+                                const yearHeaders = timelineBody.querySelectorAll(':scope > h4');
+                                let targetTimeline = null;
+                                for (const h4 of yearHeaders) {
+                                    if (h4.textContent.trim() === '2025') {
+                                        targetTimeline = h4.nextElementSibling;
+                                        break;
+                                    }
+                                }
+                                if (targetTimeline) {
+                                    const elements = targetTimeline.querySelectorAll(
+                                        '[class*="vertical-timeline-element"]'
+                                    );
+                                    for (const el of elements) {
+                                        const h3 = el.querySelector('h3');
+                                        const h4 = el.querySelector('h4');
+                                        if (!h3 || !h4) continue;
+                                        const h3Text = h3.textContent.trim();
+                                        const h4Text = h4.textContent.trim().toLowerCase();
+                                        const dateMatch = h3Text.match(/([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4})/);
+                                        if (!dateMatch) continue;
+                                        const dateStr = dateMatch[1];
+                                        if (!portalEntry && h4Text.includes('entered the transfer portal'))
+                                            portalEntry = dateStr;
+                                        if (!commitDate && (h4Text.includes('commits to') || h4Text.includes('enrolls at')))
+                                            commitDate = dateStr;
+                                        if (portalEntry && commitDate) break;
+                                    }
+                                    method += '+dom_2025';
+                                }
+                            } else {
+                                method += '+no_timeline_body';
+                            }
                         }
 
-                        // Get events from 2025 section only
-                        const elements = targetTimeline.querySelectorAll(
-                            '[class*="vertical-timeline-element"]'
-                        );
-
-                        for (const el of elements) {
-                            const h3 = el.querySelector('h3');
-                            const h4 = el.querySelector('h4');
-                            if (!h3 || !h4) continue;
-
-                            const h3Text = h3.textContent.trim();
-                            const h4Text = h4.textContent.trim().toLowerCase();
-
-                            const dateMatch = h3Text.match(
-                                /([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4})/
-                            );
-                            if (!dateMatch) continue;
-                            const dateStr = dateMatch[1];
-
-                            if (!portalEntry &&
-                                (h4Text.includes('entered the transfer portal') ||
-                                 h4Text.includes('enters the transfer portal'))) {
-                                portalEntry = dateStr;
-                            }
-
-                            if (!commitDate &&
-                                (h4Text.includes('commits to') ||
-                                 h4Text.includes('committed to') ||
-                                 h4Text.includes('signs with') ||
-                                 h4Text.includes('enrolls at') ||
-                                 h4Text.includes('transfers to'))) {
-                                commitDate = dateStr;
-                            }
-
-                            if (portalEntry && commitDate) break;
-                        }
-
-                        return {
-                            portalEntry, commitDate,
-                            debug: 'years=[' + allYears.join(',') + '] 2025_elems=' + elements.length
-                        };
+                        if (!method) method = 'no_script_no_dom';
+                        return { portalEntry, commitDate, method };
                     }
                     """)
 
@@ -341,7 +342,7 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
 
                     pe = player['portalEntryDate'] or 'MISS'
                     cd = player['commitDate'] or 'MISS'
-                    extra = f" | {dates.get('debug','')}" if i < 10 else ""
+                    extra = f" | {dates.get('method','')}" if i < 10 else ""
                     print(f"portal={pe} | commit={cd}{extra}")
                     break
 
