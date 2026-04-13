@@ -3,6 +3,16 @@ name: Scrape 247 Basketball Transfer Portal
 on:
   workflow_dispatch:
     inputs:
+      class_year:
+        description: 'Transfer portal class year'
+        required: true
+        default: '2025'
+        type: choice
+        options:
+          - '2023'
+          - '2024'
+          - '2025'
+          - '2026'
       player_count:
         description: 'Number of players to scrape'
         required: true
@@ -33,25 +43,23 @@ jobs:
           playwright install-deps chromium
 
       - name: Run scraper
-        run: python scrape_247_bball_portal.py ${{ inputs.player_count }}
+        run: python scrape_247_bball_portal.py ${{ inputs.player_count }} --year ${{ inputs.class_year }}
 
       - name: Upload CSV
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: transfer-portal-csv
-          path: transfer_portal_top_250.csv
+          name: transfer-portal-${{ inputs.class_year }}-csv
+          path: transfer_portal_top_${{ inputs.class_year }}.csv
           retention-days: 30
 
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diagnostics
+          name: diagnostics-${{ inputs.class_year }}
           path: |
-            diag_player_elements.json
-            diag_full_page.html
-            diag_screenshot.png
             diag_first_profile_timeline.html
+            diag_screenshot.png
           if-no-files-found: ignore
           retention-days: 7
