@@ -1,21 +1,25 @@
 """
 247Sports 2025 Basketball Transfer Portal Top 250 Scraper
 Phase 1: Scroll-load players from rankings page using li.transfer-player elements.
-Phase 2: Visit each player profile to get portal entry + commit dates from Timeline.
+Phase 2: Visit each player profile, wait for section.timeline to load,
+         extract portal entry + commit dates from the 2025 year section only.
 
-DOM structure (from diagnostics):
-  li.transfer-player.is-ranked
-    div.playerRank > span  (rank number)
-    div.avatar > ... > a[href*="/player/"]  (profile link)
-    h3 > a  (player name + profile link)
-    div.starContainer  (SVG stars)
-    div.rating  (0.9900)
-    div.trend
-    div.position  (PF)
-    div.bio  (6-9 / 230)
-    div.status  (Enrolled)
-    div.statusDate  (may contain date)
-    div.transfer-prediction  (team logos/links)
+Timeline DOM structure (from browser inspection):
+  section.timeline
+    div#timeline
+    div.timeline-body
+      h4  "2026"                          (year header - direct child of timeline-body)
+      div.vertical-timeline              (events for 2026)
+      h4  "2025"                          (year header)
+      div.vertical-timeline              (events for 2025 - THIS IS WHAT WE WANT)
+        div.vertical-timeline-element
+          h3  "Mar 31, 2025: Transfer"   (date + type)
+          h4  "Player entered the transfer portal"  (description)
+        div.vertical-timeline-element
+          h3  "Apr 5, 2025: Transfer"
+          h4  "Player commits to Michigan Wolverines"
+      h4  "2023"
+      div.vertical-timeline              (events for 2023 - skip)
 """
 
 import asyncio
@@ -42,9 +46,8 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(5000)
 
-        # Dismiss popups
         for sel in ["button.close", ".modal-close", "[aria-label='Close']",
-                     ".onesignal-popover-cancel-btn", "#onesignal-popover-cancel-btn"]:
+                     ".onesignal-popover-cancel-btn"]:
             try:
                 btn = page.locator(sel).first
                 if await btn.is_visible(timeout=1000):
@@ -53,7 +56,6 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
             except:
                 pass
 
-        # Scroll to load players — count using the REAL selector
         consecutive_no_change = 0
         prev_count = 0
 
@@ -76,7 +78,6 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
                 consecutive_no_change = 0
             prev_count = current_count
 
-            # Try Load More button
             try:
                 load_more = page.locator("a:has-text('Load More'), button:has-text('Load More')").first
                 if await load_more.is_visible(timeout=800):
@@ -89,36 +90,27 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(random.uniform(2000, 3500))
 
-        # ── Extract using exact DOM structure from diagnostics ──
-        print("[Phase 1] Extracting player data from li.transfer-player elements...")
+        # ── Extract from li.transfer-player ──
+        print("[Phase 1] Extracting player data...")
         players = await page.evaluate("""
         () => {
             const results = [];
-            const items = document.querySelectorAll('li.transfer-player');
-
-            items.forEach((li) => {
-                // Rank: div.playerRank > span
-                const rankEl = li.querySelector('div.playerRank span, .playerRank span');
+            document.querySelectorAll('li.transfer-player').forEach(li => {
+                const rankEl = li.querySelector('.playerRank span');
                 const rank = rankEl ? rankEl.textContent.trim() : '';
 
-                // Name + Profile URL: h3 > a
                 const nameLink = li.querySelector('h3 a');
-                const name = nameLink ? nameLink.textContent.trim() : '';
-                const profileUrl = nameLink ? nameLink.href : '';
-
-                // If no name from h3, try avatar link
-                let finalName = name;
-                if (!finalName) {
-                    const avatarImg = li.querySelector('div.avatar img');
-                    if (avatarImg) finalName = avatarImg.alt || '';
+                let name = nameLink ? nameLink.textContent.trim() : '';
+                let profileUrl = nameLink ? nameLink.href : '';
+                if (!name) {
+                    const img = li.querySelector('div.avatar img');
+                    if (img) name = img.alt || '';
                 }
-                let finalUrl = profileUrl;
-                if (!finalUrl) {
-                    const avatarLink = li.querySelector('div.avatar a[href*="/player/"]');
-                    if (avatarLink) finalUrl = avatarLink.href;
+                if (!profileUrl) {
+                    const a = li.querySelector('div.avatar a[href*="/player/"]');
+                    if (a) profileUrl = a.href;
                 }
 
-                // Rating: div.rating
                 const ratingEl = li.querySelector('div.rating');
                 let rating = '';
                 if (ratingEl) {
@@ -126,7 +118,6 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
                     if (m) rating = m[1];
                 }
 
-                // Position: div.position
                 const posEl = li.querySelector('div.position');
                 let position = '';
                 if (posEl) {
@@ -134,7 +125,6 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
                     if (m) position = m[1];
                 }
 
-                // Height / Weight: div.bio (e.g. "6-9 / 230")
                 const bioEl = li.querySelector('div.bio');
                 let height = '', weight = '';
                 if (bioEl) {
@@ -142,102 +132,51 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
                     if (m) { height = m[1]; weight = m[2]; }
                 }
 
-                // Stars: count SVGs in div.starContainer
                 const starContainer = li.querySelector('div.starContainer');
-                let stars = 0;
-                if (starContainer) {
-                    stars = starContainer.querySelectorAll('svg').length;
-                }
+                let stars = starContainer ? starContainer.querySelectorAll('svg').length : 0;
 
-                // Status: div.status
-                const statusEl = li.querySelector('div.status');
-                const status = statusEl ? statusEl.textContent.trim() : '';
-
-                // StatusDate: div.statusDate (may have the date right on the list page)
-                const statusDateEl = li.querySelector('div.statusDate');
-                const statusDate = statusDateEl ? statusDateEl.textContent.trim() : '';
-
-                // Teams: look in div.transfer-prediction for team links/images
                 let fromTeam = '', toTeam = '';
-
-                // From team: first team image/link before "transferred to"
                 const teamImgs = li.querySelectorAll('a[href*="/college/"][href*="transferportal"] img');
                 if (teamImgs.length >= 1) fromTeam = teamImgs[0].alt || '';
                 if (teamImgs.length >= 2) toTeam = teamImgs[1].alt || '';
-
-                // Fallback: use title attributes on team links
                 if (!fromTeam || !toTeam) {
                     const teamLinks = li.querySelectorAll('a[href*="/college/"][href*="transferportal"]');
-                    const cleanTitle = (t) => {
-                        if (!t) return '';
-                        return t.replace(/View \\d{4} basketball transfer players for /gi, '').trim();
-                    };
-                    if (teamLinks.length >= 1 && !fromTeam) fromTeam = cleanTitle(teamLinks[0].title);
-                    if (teamLinks.length >= 2 && !toTeam) toTeam = cleanTitle(teamLinks[1].title);
+                    const clean = t => t ? t.replace(/View \\d{4} basketball transfer players for /gi, '').trim() : '';
+                    if (teamLinks.length >= 1 && !fromTeam) fromTeam = clean(teamLinks[0].title);
+                    if (teamLinks.length >= 2 && !toTeam) toTeam = clean(teamLinks[1].title);
                 }
 
-                if (finalName) {
-                    results.push({
-                        rank, name: finalName, position, height, weight,
-                        stars, rating, status, statusDate,
-                        fromTeam, toTeam, profileUrl: finalUrl
-                    });
+                if (name) {
+                    results.push({ rank, name, position, height, weight, stars, rating, fromTeam, toTeam, profileUrl });
                 }
             });
-
             return results;
         }
         """)
 
         print(f"[Phase 1] Extracted {len(players)} players")
-
-        # Print first 5 for verification
         for p in players[:5]:
             print(f"  #{p['rank']} {p['name']} ({p['position']}) {p['height']}/{p['weight']} "
-                  f"rating={p['rating']} stars={p['stars']} status={p['status']} "
-                  f"statusDate={p['statusDate']} {p['fromTeam']} -> {p['toTeam']}")
+                  f"rating={p['rating']} stars={p['stars']} {p['fromTeam']} -> {p['toTeam']}")
 
         if len(players) == 0:
-            print("\n[FATAL] Zero players extracted. Saving debug info...")
-            html = await page.content()
-            with open("diag_full_page.html", "w") as f:
-                f.write(html[:500000])
+            print("[FATAL] Zero players extracted.")
             await page.screenshot(path="diag_screenshot.png", full_page=False)
-
-            # Extra diag: dump all li classes
-            classes = await page.evaluate("""
-                () => {
-                    const lis = document.querySelectorAll('li');
-                    const classMap = {};
-                    lis.forEach(li => {
-                        const c = li.className || '(none)';
-                        classMap[c] = (classMap[c] || 0) + 1;
-                    });
-                    return classMap;
-                }
-            """)
-            print("[Diag] li class distribution:")
-            for cls, cnt in sorted(classes.items(), key=lambda x: -x[1])[:20]:
-                print(f"  {cnt}x  class='{cls}'")
-
             with open(output_file, "w", newline="") as f:
                 csv.writer(f).writerow([
-                    "Rank", "Player Name", "Position", "Height", "Weight",
-                    "Stars", "247 Transfer Rating", "Portal Entry Date",
-                    "Commit Date", "24/25 Team", "25/26 Team", "Profile URL"
+                    "Rank","Player Name","Position","Height","Weight","Stars",
+                    "247 Transfer Rating","Portal Entry Date","Commit Date",
+                    "24/25 Team","25/26 Team","Profile URL"
                 ])
             await browser.close()
             return
 
-        # Cap to target count
         players = players[:target_count]
 
-        # ── PHASE 2: Visit each profile for timeline dates ──
+        # ── PHASE 2: Visit profiles for timeline dates ──
         print(f"\n[Phase 2] Visiting {len(players)} player profiles for dates...")
         total = len(players)
-
-        # Save first profile HTML for debugging
-        save_first_profile_debug = True
+        save_debug = True
 
         for i, player in enumerate(players):
             profile_url = player.get("profileUrl", "")
@@ -252,54 +191,112 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
                 try:
                     print(f"  [{i+1}/{total}] {player['name']}...", end=" ", flush=True)
                     await page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
-                    await page.wait_for_timeout(random.uniform(1500, 2500))
+                    await page.wait_for_timeout(2000)
 
-                    # Scroll to timeline section
-                    await page.evaluate("""
-                        () => {
-                            const el = document.querySelector('#timeline, section.timeline, .timeline');
-                            if (el) el.scrollIntoView({behavior: 'instant'});
-                        }
-                    """)
-                    await page.wait_for_timeout(800)
+                    # Full scroll to bottom to trigger lazy-load of timeline
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page.wait_for_timeout(2000)
 
-                    # Expand timeline if needed
+                    # Wait for section.timeline to appear
+                    timeline_loaded = False
                     try:
-                        see_all = page.locator("a:has-text('See all'), a:has-text('Load more')").first
-                        if await see_all.is_visible(timeout=1500):
-                            await see_all.click()
-                            await page.wait_for_timeout(1500)
+                        await page.wait_for_selector("section.timeline", timeout=6000)
+                        timeline_loaded = True
                     except:
-                        pass
+                        # Retry: scroll top then bottom again
+                        await page.evaluate("window.scrollTo(0, 0)")
+                        await page.wait_for_timeout(500)
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await page.wait_for_timeout(3000)
+                        try:
+                            await page.wait_for_selector("section.timeline", timeout=5000)
+                            timeline_loaded = True
+                        except:
+                            pass
 
-                    # Debug: save first profile's timeline HTML
-                    if save_first_profile_debug:
-                        save_first_profile_debug = False
-                        debug_html = await page.evaluate("""
+                    if not timeline_loaded:
+                        # Last resort: step-scroll
+                        height = await page.evaluate("() => document.body.scrollHeight")
+                        for y in range(0, height, 400):
+                            await page.evaluate(f"window.scrollTo(0, {y})")
+                            await page.wait_for_timeout(250)
+                        await page.wait_for_timeout(2000)
+                        try:
+                            await page.wait_for_selector("section.timeline", timeout=3000)
+                            timeline_loaded = True
+                        except:
+                            pass
+
+                    # Expand "See all X entries"
+                    if timeline_loaded:
+                        try:
+                            see_all = page.locator(
+                                "a:has-text('See all'), a:has-text('Load more')"
+                            ).first
+                            if await see_all.is_visible(timeout=1500):
+                                await see_all.click()
+                                await page.wait_for_timeout(2000)
+                        except:
+                            pass
+
+                    # Debug first profile
+                    if save_debug:
+                        save_debug = False
+                        debug_info = await page.evaluate("""
                         () => {
-                            const timeline = document.querySelector('#timeline, section.timeline, .timeline');
-                            if (timeline) return timeline.outerHTML.substring(0, 5000);
-                            // If no timeline, dump all section/div IDs and classes
-                            const sections = document.querySelectorAll('section, div[id]');
-                            const info = [];
-                            sections.forEach(s => {
-                                info.push({tag: s.tagName, id: s.id, class: s.className.substring(0,80)});
-                            });
-                            return 'NO TIMELINE. Sections: ' + JSON.stringify(info.slice(0, 30));
+                            const section = document.querySelector('section.timeline');
+                            if (!section) return 'NO section.timeline found on page';
+                            const body = section.querySelector('.timeline-body');
+                            if (!body) return 'section.timeline exists but no .timeline-body child';
+                            const yearH4s = body.querySelectorAll(':scope > h4');
+                            const years = Array.from(yearH4s).map(h => h.textContent.trim());
+                            const allElems = section.querySelectorAll('[class*="vertical-timeline-element"]');
+                            return JSON.stringify({
+                                years: years,
+                                totalTimelineElements: allElems.length,
+                                bodySnippet: body.innerHTML.substring(0, 3000)
+                            }, null, 2);
                         }
                         """)
                         with open("diag_first_profile_timeline.html", "w") as f:
-                            f.write(debug_html)
-                        print(f"\n    [Debug] Saved first profile timeline HTML ({len(debug_html)} chars)")
+                            f.write(debug_info)
+                        print(f"\n    [Debug] Saved profile debug ({len(debug_info)} chars)")
 
-                    # Extract dates from timeline
+                    # ── Extract dates from 2025 year section ONLY ──
                     dates = await page.evaluate("""
                     () => {
                         let portalEntry = '';
                         let commitDate = '';
 
-                        // Method 1: vertical-timeline-element containers with h3+h4
-                        const elements = document.querySelectorAll('[class*="vertical-timeline-element"]');
+                        const timelineBody = document.querySelector('.timeline-body');
+                        if (!timelineBody) {
+                            return { portalEntry: '', commitDate: '', debug: 'no timeline-body' };
+                        }
+
+                        // Find year headers (direct child h4 of timeline-body)
+                        const yearHeaders = timelineBody.querySelectorAll(':scope > h4');
+                        let targetTimeline = null;
+                        const allYears = Array.from(yearHeaders).map(h => h.textContent.trim());
+
+                        for (const h4 of yearHeaders) {
+                            if (h4.textContent.trim() === '2025') {
+                                targetTimeline = h4.nextElementSibling;
+                                break;
+                            }
+                        }
+
+                        if (!targetTimeline) {
+                            return {
+                                portalEntry: '', commitDate: '',
+                                debug: 'years=[' + allYears.join(',') + '] no 2025 section'
+                            };
+                        }
+
+                        // Get events from 2025 section only
+                        const elements = targetTimeline.querySelectorAll(
+                            '[class*="vertical-timeline-element"]'
+                        );
+
                         for (const el of elements) {
                             const h3 = el.querySelector('h3');
                             const h4 = el.querySelector('h4');
@@ -308,67 +305,33 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
                             const h3Text = h3.textContent.trim();
                             const h4Text = h4.textContent.trim().toLowerCase();
 
-                            const dateMatch = h3Text.match(/([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4})/);
+                            const dateMatch = h3Text.match(
+                                /([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4})/
+                            );
                             if (!dateMatch) continue;
                             const dateStr = dateMatch[1];
 
-                            if (h4Text.includes('entered the transfer portal') ||
-                                h4Text.includes('enters the transfer portal')) {
+                            if (!portalEntry &&
+                                (h4Text.includes('entered the transfer portal') ||
+                                 h4Text.includes('enters the transfer portal'))) {
                                 portalEntry = dateStr;
                             }
-                            if (h4Text.includes('commits to') ||
-                                h4Text.includes('committed to') ||
-                                h4Text.includes('signs with') ||
-                                h4Text.includes('enrolls at')) {
-                                if (!commitDate) commitDate = dateStr;
+
+                            if (!commitDate &&
+                                (h4Text.includes('commits to') ||
+                                 h4Text.includes('committed to') ||
+                                 h4Text.includes('signs with') ||
+                                 h4Text.includes('enrolls at') ||
+                                 h4Text.includes('transfers to'))) {
+                                commitDate = dateStr;
                             }
+
+                            if (portalEntry && commitDate) break;
                         }
 
-                        // Method 2: search full timeline text
-                        if (!portalEntry || !commitDate) {
-                            const section = document.querySelector('#timeline, section.timeline, .timeline, .timeline-body');
-                            if (section) {
-                                const text = section.textContent;
-                                if (!portalEntry) {
-                                    const m = text.match(/([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4}).*?(?:entered|enters)\\s+the\\s+transfer/);
-                                    if (m) portalEntry = m[1];
-                                }
-                                if (!commitDate) {
-                                    const m = text.match(/([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4}).*?(?:commits? to|enrolls? at)/);
-                                    if (m) commitDate = m[1];
-                                }
-                            }
-                        }
-
-                        // Method 3: scan ALL h3/h4 pairs on the page (timeline might not be in expected container)
-                        if (!portalEntry || !commitDate) {
-                            const allH3 = document.querySelectorAll('h3');
-                            for (const h3 of allH3) {
-                                const h4 = h3.parentElement?.querySelector('h4') ||
-                                           h3.nextElementSibling;
-                                if (!h4 || h4.tagName !== 'H4') continue;
-                                const h3Text = h3.textContent.trim();
-                                const h4Text = h4.textContent.trim().toLowerCase();
-                                const dateMatch = h3Text.match(/([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4})/);
-                                if (!dateMatch) continue;
-                                const dateStr = dateMatch[1];
-                                if (!portalEntry && (h4Text.includes('entered the transfer portal') ||
-                                    h4Text.includes('enters the transfer portal'))) {
-                                    portalEntry = dateStr;
-                                }
-                                if (!commitDate && (h4Text.includes('commits to') ||
-                                    h4Text.includes('enrolls at'))) {
-                                    commitDate = dateStr;
-                                }
-                            }
-                        }
-
-                        const timelineEl = document.querySelector('#timeline, section.timeline, .timeline');
-                        const elemCount = elements.length;
                         return {
                             portalEntry, commitDate,
-                            timelineExists: !!timelineEl,
-                            elemCount
+                            debug: 'years=[' + allYears.join(',') + '] 2025_elems=' + elements.length
                         };
                     }
                     """)
@@ -378,7 +341,7 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
 
                     pe = player['portalEntryDate'] or 'MISS'
                     cd = player['commitDate'] or 'MISS'
-                    extra = f" | timeline={dates.get('timelineExists')} elems={dates.get('elemCount')}" if i < 5 else ""
+                    extra = f" | {dates.get('debug','')}" if i < 10 else ""
                     print(f"portal={pe} | commit={cd}{extra}")
                     break
 
@@ -392,13 +355,12 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
                         player["portalEntryDate"] = ""
                         player["commitDate"] = ""
 
-            # Cooldown every 10 players
             if i % 10 == 9:
                 delay = random.uniform(2, 5)
                 print(f"  (cooldown {delay:.1f}s)")
                 await page.wait_for_timeout(delay * 1000)
 
-        # ── QA Summary ──
+        # ── QA ──
         total_players = len(players)
         has_portal = sum(1 for p in players if p.get("portalEntryDate"))
         has_commit = sum(1 for p in players if p.get("commitDate"))
@@ -407,11 +369,11 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
         print(f"[QA] Portal entry date: {has_portal}/{total_players} ({100*has_portal/max(total_players,1):.0f}%)")
         print(f"[QA] Commit date: {has_commit}/{total_players} ({100*has_commit/max(total_players,1):.0f}%)")
         print(f"[QA] Both dates: {has_both}/{total_players}")
-        missing_portal = [p['name'] for p in players if not p.get("portalEntryDate")][:10]
-        if missing_portal:
-            print(f"[QA] Missing portal date (first 10): {', '.join(missing_portal)}")
+        missing = [p['name'] for p in players if not p.get("portalEntryDate")][:10]
+        if missing:
+            print(f"[QA] Missing portal date (first 10): {', '.join(missing)}")
 
-        # ── Write CSV ──
+        # ── CSV ──
         print(f"\n[Output] Writing {len(players)} rows to {output_file}")
         with open(output_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -422,18 +384,11 @@ async def scrape_transfer_portal(target_count=250, output_file="transfer_portal_
             ])
             for p in players:
                 writer.writerow([
-                    p.get("rank", ""),
-                    p.get("name", ""),
-                    p.get("position", ""),
-                    p.get("height", ""),
-                    p.get("weight", ""),
-                    p.get("stars", ""),
-                    p.get("rating", ""),
-                    p.get("portalEntryDate", ""),
-                    p.get("commitDate", ""),
-                    p.get("fromTeam", ""),
-                    p.get("toTeam", ""),
-                    p.get("profileUrl", ""),
+                    p.get("rank",""), p.get("name",""), p.get("position",""),
+                    p.get("height",""), p.get("weight",""), p.get("stars",""),
+                    p.get("rating",""), p.get("portalEntryDate",""),
+                    p.get("commitDate",""), p.get("fromTeam",""),
+                    p.get("toTeam",""), p.get("profileUrl",""),
                 ])
 
         print("Done!")
