@@ -5,10 +5,19 @@ Phase 1: Scroll-load players from rankings page using li.transfer-player element
 Phase 2: Visit each player profile, parse script#timelineJson for dates + draft info.
          Falls back to DOM parsing if JSON not found.
 
-Year logic:
-  - Portal entry date: class_year first, fall back to class_year-1
-  - Commit date: class_year ONLY (never prior year)
-  - Draft info: any year (take most recent draft event)
+JSON structure (from diagnostics):
+  [{
+    "count": 44,
+    "seeAllEntriesLink": "/Player/.../TimelineEvents/",
+    "timeLineData": [
+      {"date":"May 4, 2023", "year":"2023", "event":"Transfer",
+       "body":"Player transfers to School", "institution":"School", ...},
+      ...
+    ]
+  }]
+
+Note: timeLineData is TRUNCATED (only ~10-15 events). Draft events are often
+not included. Must click "See all" and parse DOM for draft info.
 """
 
 import asyncio
@@ -201,17 +210,15 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                             if (script) {
                                 return 'FOUND script#timelineJson: ' + script.textContent.substring(0, 5000);
                             }
-                            const allScripts = document.querySelectorAll('script[id]');
-                            const ids = Array.from(allScripts).map(s => s.id);
-                            return 'NO script#timelineJson. Script IDs: ' + ids.join(', ');
+                            return 'NO script#timelineJson found';
                         }
                         """)
                         with open("diag_first_profile_timeline.html", "w") as f:
                             f.write(debug_info)
                         print(f"\n    [Debug] Saved ({len(debug_info)} chars)")
 
-                    # ── Extract dates + draft info ──
-                    dates = await page.evaluate("""
+                    # ── Step 1: Parse JSON for portal entry + commit ──
+                    json_dates = await page.evaluate("""
                     (args) => {
                         const classYear = args.classYear;
                         const priorYear = args.priorYear;
@@ -222,227 +229,237 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                         let draftPick = '';
                         let method = '';
 
-                        const cleanDate = (d) => {
-                            if (!d) return '';
-                            const m = d.match(/([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4})/);
-                            if (m) return m[1];
-                            try {
-                                const dt = new Date(d);
-                                if (!isNaN(dt)) {
-                                    const months = ['Jan','Feb','Mar','Apr','May','Jun',
-                                                  'Jul','Aug','Sep','Oct','Nov','Dec'];
-                                    return months[dt.getMonth()] + ' ' + dt.getDate() + ', ' + dt.getFullYear();
-                                }
-                            } catch(e) {}
-                            return d;
-                        };
+                        const isPortalEvent = (body) =>
+                            body.includes('entered the transfer portal') ||
+                            body.includes('enters the transfer portal');
 
-                        const isPortalEvent = (desc) =>
-                            desc.includes('entered the transfer portal') ||
-                            desc.includes('enters the transfer portal');
+                        const isCommitEvent = (body) =>
+                            body.includes('transfers to') ||
+                            body.includes('commits to') ||
+                            body.includes('committed to') ||
+                            body.includes('signs with') ||
+                            body.includes('enrolls at');
 
-                        const isCommitEvent = (desc) =>
-                            desc.includes('commits to') ||
-                            desc.includes('committed to') ||
-                            desc.includes('signs with') ||
-                            desc.includes('enrolls at') ||
-                            desc.includes('transfers to');
+                        const isDraftEvent = (body) =>
+                            body.includes('draft') && body.includes('no.');
 
-                        const isDraftEvent = (desc) =>
-                            desc.includes('draft') && desc.includes('with the no.');
-
-                        const parseDraftInfo = (desc) => {
-                            // "Miami Heat draft Kel'el Ware with the No. 15 pick..."
+                        const parseDraft = (body) => {
                             let team = '';
                             let pick = '';
-                            const teamMatch = desc.match(/^(.+?)\\s+draft\\s+/i);
-                            if (teamMatch) team = teamMatch[1].trim();
-                            // Capitalize properly (desc is lowercased)
-                            if (team) {
-                                team = team.replace(/\\b\\w/g, c => c.toUpperCase());
+                            // body: "miami heat draft player with the no. 15 pick..."
+                            const teamMatch = body.match(/^(.+?)\\s+draft\\s+/i);
+                            if (teamMatch) {
+                                team = teamMatch[1].trim()
+                                    .replace(/\\b\\w/g, c => c.toUpperCase());
                             }
-                            const pickMatch = desc.match(/no\\.\\s*(\\d+)/i);
+                            const pickMatch = body.match(/no\\.\\s*(\\d+)/i);
                             if (pickMatch) pick = pickMatch[1];
                             return { team, pick };
                         };
 
-                        const eventMatchesYear = (evt, year) => {
-                            const y = String(evt.Year || evt.year || '');
-                            const d = evt.DateString || evt.dateString || evt.Date ||
-                                      evt.date || evt.FormattedDate || evt.formattedDate ||
-                                      evt.EventDate || evt.eventDate || '';
-                            return y === year || d.includes(year);
-                        };
-
-                        // === METHOD 1: Parse script#timelineJson ===
                         const script = document.querySelector('script#timelineJson');
                         if (script) {
                             try {
-                                const data = JSON.parse(script.textContent);
-                                method = 'json';
-
-                                let flatEvents = [];
-                                if (Array.isArray(data)) {
-                                    flatEvents = data;
-                                } else if (typeof data === 'object') {
-                                    if (data.Events) flatEvents = data.Events;
-                                    else if (data.events) flatEvents = data.events;
-                                    else if (data.items) flatEvents = data.items;
-                                    else if (data.TimelineEvents) flatEvents = data.TimelineEvents;
-                                    else {
-                                        for (const key of Object.keys(data)) {
-                                            if (Array.isArray(data[key]))
-                                                flatEvents = flatEvents.concat(data[key]);
-                                        }
-                                    }
+                                const raw = JSON.parse(script.textContent);
+                                // Structure: [{count, seeAllEntriesLink, timeLineData: [...]}]
+                                let events = [];
+                                if (Array.isArray(raw) && raw.length > 0 && raw[0].timeLineData) {
+                                    events = raw[0].timeLineData;
+                                    method = 'json_timeLineData=' + events.length;
+                                } else if (Array.isArray(raw) && raw.length > 0 && Array.isArray(raw[0])) {
+                                    events = raw[0];
+                                    method = 'json_nested=' + events.length;
+                                } else {
+                                    method = 'json_unknown_structure';
                                 }
-
-                                method += '_events=' + flatEvents.length;
-                                if (flatEvents.length > 0) {
-                                    method += '_keys=' + Object.keys(flatEvents[0]).slice(0,5).join('|');
-                                }
-
-                                const getDesc = (evt) => (
-                                    evt.Description || evt.description || evt.headline ||
-                                    evt.title || evt.Title || evt.text ||
-                                    evt.Headline || evt.Action || evt.action || ''
-                                ).toLowerCase();
-
-                                const getDate = (evt) =>
-                                    evt.DateString || evt.dateString || evt.Date ||
-                                    evt.date || evt.FormattedDate || evt.formattedDate ||
-                                    evt.EventDate || evt.eventDate || '';
 
                                 // PASS 1: classYear for portal entry + commit
-                                for (const evt of flatEvents) {
-                                    if (!eventMatchesYear(evt, classYear)) continue;
-                                    const desc = getDesc(evt);
-                                    const dateStr = getDate(evt);
-                                    if (!portalEntry && isPortalEvent(desc))
-                                        portalEntry = cleanDate(dateStr);
-                                    if (!commitDate && isCommitEvent(desc))
-                                        commitDate = cleanDate(dateStr);
+                                for (const evt of events) {
+                                    if (String(evt.year) !== classYear &&
+                                        !(evt.date || '').includes(classYear)) continue;
+                                    const body = (evt.body || '').toLowerCase();
+                                    if (!portalEntry && isPortalEvent(body))
+                                        portalEntry = evt.date || '';
+                                    if (!commitDate && isCommitEvent(body))
+                                        commitDate = evt.date || '';
                                     if (portalEntry && commitDate) break;
                                 }
 
                                 // PASS 2: priorYear for portal entry ONLY
                                 if (!portalEntry) {
-                                    for (const evt of flatEvents) {
-                                        if (!eventMatchesYear(evt, priorYear)) continue;
-                                        const desc = getDesc(evt);
-                                        const dateStr = getDate(evt);
-                                        if (isPortalEvent(desc)) {
-                                            portalEntry = cleanDate(dateStr);
+                                    for (const evt of events) {
+                                        if (String(evt.year) !== priorYear &&
+                                            !(evt.date || '').includes(priorYear)) continue;
+                                        const body = (evt.body || '').toLowerCase();
+                                        if (isPortalEvent(body)) {
+                                            portalEntry = evt.date || '';
                                             method += '+prior_entry';
                                             break;
                                         }
                                     }
                                 }
 
-                                // PASS 3: Draft info — scan ALL events, take most recent
-                                for (const evt of flatEvents) {
-                                    const desc = getDesc(evt);
-                                    const dateStr = getDate(evt);
-                                    if (isDraftEvent(desc)) {
-                                        draftDate = cleanDate(dateStr);
-                                        const info = parseDraftInfo(desc);
+                                // PASS 3: Draft from truncated JSON (any year, most recent first)
+                                for (const evt of events) {
+                                    const body = (evt.body || '').toLowerCase();
+                                    if (isDraftEvent(body)) {
+                                        draftDate = evt.date || '';
+                                        const info = parseDraft(body);
                                         draftTeam = info.team;
                                         draftPick = info.pick;
-                                        break;  // first match = most recent
+                                        break;
                                     }
                                 }
 
                             } catch(e) {
                                 method = 'json_error:' + e.message.substring(0, 50);
                             }
+                        } else {
+                            method = 'no_json';
                         }
 
-                        // === METHOD 2 FALLBACK: DOM year sections ===
-                        if (!portalEntry || !commitDate || !draftDate) {
-                            window.scrollTo(0, document.body.scrollHeight);
-
-                            const timelineBody = document.querySelector('.timeline-body');
-                            if (timelineBody) {
-                                const yearHeaders = timelineBody.querySelectorAll(':scope > h4');
-
-                                const extractFromYear = (yearText) => {
-                                    let pe = '', cd = '', dd = '', dt = '', dp = '';
-                                    for (const h4 of yearHeaders) {
-                                        if (h4.textContent.trim() !== yearText) continue;
-                                        const timeline = h4.nextElementSibling;
-                                        if (!timeline) continue;
-                                        const elements = timeline.querySelectorAll(
-                                            '[class*="vertical-timeline-element"]'
-                                        );
-                                        for (const el of elements) {
-                                            const h3 = el.querySelector('h3');
-                                            const h4el = el.querySelector('h4');
-                                            if (!h3 || !h4el) continue;
-                                            const h3Text = h3.textContent.trim();
-                                            const h4Text = h4el.textContent.trim().toLowerCase();
-                                            const dateMatch = h3Text.match(/([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4})/);
-                                            if (!dateMatch) continue;
-                                            if (!pe && isPortalEvent(h4Text)) pe = dateMatch[1];
-                                            if (!cd && isCommitEvent(h4Text)) cd = dateMatch[1];
-                                            if (!dd && isDraftEvent(h4Text)) {
-                                                dd = dateMatch[1];
-                                                const info = parseDraftInfo(h4Text);
-                                                dt = info.team;
-                                                dp = info.pick;
-                                            }
-                                        }
-                                        break;
-                                    }
-                                    return { pe, cd, dd, dt, dp };
-                                };
-
-                                // DOM: classYear for both portal + commit
-                                const r1 = extractFromYear(classYear);
-                                if (!portalEntry && r1.pe) portalEntry = r1.pe;
-                                if (!commitDate && r1.cd) commitDate = r1.cd;
-
-                                // DOM: priorYear for portal entry ONLY
-                                if (!portalEntry) {
-                                    const r2 = extractFromYear(priorYear);
-                                    if (r2.pe) { portalEntry = r2.pe; method += '+dom_prior'; }
-                                }
-
-                                // DOM: draft from ALL years
-                                if (!draftDate) {
-                                    for (const h4 of yearHeaders) {
-                                        const r = extractFromYear(h4.textContent.trim());
-                                        if (r.dd) {
-                                            draftDate = r.dd;
-                                            draftTeam = r.dt;
-                                            draftPick = r.dp;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                method += '+dom';
-                            } else {
-                                method += '+no_dom';
-                            }
-                        }
-
-                        if (!method) method = 'nothing_found';
                         return { portalEntry, commitDate, draftDate, draftTeam, draftPick, method };
                     }
                     """, {"classYear": str(class_year), "priorYear": str(class_year - 1)})
 
-                    player["portalEntryDate"] = dates.get("portalEntry", "")
-                    player["commitDate"] = dates.get("commitDate", "")
-                    player["draftDate"] = dates.get("draftDate", "")
-                    player["draftTeam"] = dates.get("draftTeam", "")
-                    player["draftPick"] = dates.get("draftPick", "")
+                    player["portalEntryDate"] = json_dates.get("portalEntry", "")
+                    player["commitDate"] = json_dates.get("commitDate", "")
+                    player["draftDate"] = json_dates.get("draftDate", "")
+                    player["draftTeam"] = json_dates.get("draftTeam", "")
+                    player["draftPick"] = json_dates.get("draftPick", "")
+                    method = json_dates.get("method", "")
+
+                    # ── Step 2: DOM fallback for anything still missing ──
+                    needs_dom = (not player["portalEntryDate"] or
+                                 not player["commitDate"] or
+                                 not player["draftDate"])
+
+                    if needs_dom:
+                        # Scroll to trigger timeline lazy-load
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await page.wait_for_timeout(2000)
+
+                        try:
+                            await page.wait_for_selector("section.timeline", timeout=5000)
+                        except:
+                            await page.evaluate("window.scrollTo(0, 0)")
+                            await page.wait_for_timeout(300)
+                            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                            await page.wait_for_timeout(2000)
+
+                        # ALWAYS click "See all" to load full timeline (critical for draft events)
+                        try:
+                            see_all = page.locator(
+                                "a:has-text('See all'), a:has-text('Load more')"
+                            ).first
+                            if await see_all.is_visible(timeout=2000):
+                                await see_all.click()
+                                await page.wait_for_timeout(2500)
+                        except:
+                            pass
+
+                        dom_dates = await page.evaluate("""
+                        (args) => {
+                            const classYear = args.classYear;
+                            const priorYear = args.priorYear;
+                            let portalEntry = '';
+                            let commitDate = '';
+                            let draftDate = '';
+                            let draftTeam = '';
+                            let draftPick = '';
+
+                            const isPortalEvent = (t) =>
+                                t.includes('entered the transfer portal') ||
+                                t.includes('enters the transfer portal');
+                            const isCommitEvent = (t) =>
+                                t.includes('transfers to') ||
+                                t.includes('commits to') ||
+                                t.includes('enrolls at');
+                            const isDraftEvent = (t) =>
+                                t.includes('draft') && t.includes('no.');
+
+                            const timelineBody = document.querySelector('.timeline-body');
+                            if (!timelineBody) return { portalEntry:'', commitDate:'', draftDate:'', draftTeam:'', draftPick:'' };
+
+                            const yearHeaders = timelineBody.querySelectorAll(':scope > h4');
+
+                            const scanYear = (yearText) => {
+                                let pe='', cd='', dd='', dt='', dp='';
+                                for (const h4 of yearHeaders) {
+                                    if (h4.textContent.trim() !== yearText) continue;
+                                    const timeline = h4.nextElementSibling;
+                                    if (!timeline) continue;
+                                    const elems = timeline.querySelectorAll('[class*="vertical-timeline-element"]');
+                                    for (const el of elems) {
+                                        const h3 = el.querySelector('h3');
+                                        const h4el = el.querySelector('h4');
+                                        if (!h3 || !h4el) continue;
+                                        const h3Text = h3.textContent.trim();
+                                        const h4Text = h4el.textContent.trim().toLowerCase();
+                                        const dateMatch = h3Text.match(/([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4})/);
+                                        if (!dateMatch) continue;
+                                        const d = dateMatch[1];
+                                        if (!pe && isPortalEvent(h4Text)) pe = d;
+                                        if (!cd && isCommitEvent(h4Text)) cd = d;
+                                        if (!dd && isDraftEvent(h4Text)) {
+                                            dd = d;
+                                            const tm = h4Text.match(/^(.+?)\\s+draft\\s+/);
+                                            if (tm) dt = tm[1].trim().replace(/\\b\\w/g, c => c.toUpperCase());
+                                            const pm = h4Text.match(/no\\.\\s*(\\d+)/);
+                                            if (pm) dp = pm[1];
+                                        }
+                                    }
+                                    break;
+                                }
+                                return { pe, cd, dd, dt, dp };
+                            };
+
+                            // Portal entry + commit from classYear
+                            const r1 = scanYear(classYear);
+                            portalEntry = r1.pe;
+                            commitDate = r1.cd;
+
+                            // Portal entry fallback from priorYear
+                            if (!portalEntry) {
+                                const r2 = scanYear(priorYear);
+                                portalEntry = r2.pe;
+                            }
+
+                            // Draft: scan ALL years (most recent first)
+                            const allYears = Array.from(yearHeaders).map(h => h.textContent.trim());
+                            for (const yr of allYears) {
+                                const r = scanYear(yr);
+                                if (r.dd) {
+                                    draftDate = r.dd;
+                                    draftTeam = r.dt;
+                                    draftPick = r.dp;
+                                    break;
+                                }
+                            }
+
+                            return { portalEntry, commitDate, draftDate, draftTeam, draftPick };
+                        }
+                        """, {"classYear": str(class_year), "priorYear": str(class_year - 1)})
+
+                        # Merge: only fill in what's missing
+                        if not player["portalEntryDate"] and dom_dates.get("portalEntry"):
+                            player["portalEntryDate"] = dom_dates["portalEntry"]
+                            method += "+dom_pe"
+                        if not player["commitDate"] and dom_dates.get("commitDate"):
+                            player["commitDate"] = dom_dates["commitDate"]
+                            method += "+dom_cd"
+                        if not player["draftDate"] and dom_dates.get("draftDate"):
+                            player["draftDate"] = dom_dates["draftDate"]
+                            player["draftTeam"] = dom_dates.get("draftTeam", "")
+                            player["draftPick"] = dom_dates.get("draftPick", "")
+                            method += "+dom_draft"
 
                     pe = player['portalEntryDate'] or 'MISS'
                     cd = player['commitDate'] or 'MISS'
                     draft = ""
                     if player['draftDate']:
                         draft = f" | DRAFT: {player['draftTeam']} #{player['draftPick']} ({player['draftDate']})"
-                    extra = f" | {dates.get('method','')}" if i < 15 else ""
+                    extra = f" | {method}" if i < 15 else ""
                     print(f"portal={pe} | commit={cd}{draft}{extra}")
                     break
 
@@ -478,12 +495,11 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
         missing = [p['name'] for p in players if not p.get("portalEntryDate")][:15]
         if missing:
             print(f"[QA] Missing portal date (first 15): {', '.join(missing)}")
-        missing_c = [p['name'] for p in players if not p.get("commitDate")][:15]
-        if missing_c:
-            print(f"[QA] Missing commit date (first 15): {', '.join(missing_c)}")
         drafted = [f"{p['name']} -> {p['draftTeam']} #{p['draftPick']}" for p in players if p.get("draftDate")]
         if drafted:
-            print(f"[QA] Drafted players: {', '.join(drafted[:10])}")
+            print(f"[QA] Drafted players ({len(drafted)}):")
+            for d in drafted[:15]:
+                print(f"  {d}")
 
         # ── CSV ──
         prev_season = f"{class_year - 1}/{str(class_year)[-2:]}"
