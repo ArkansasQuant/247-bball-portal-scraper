@@ -5,19 +5,12 @@ Phase 1: Scroll-load players from rankings page using li.transfer-player element
 Phase 2: Visit each player profile, parse script#timelineJson for dates + draft info.
          Falls back to DOM parsing if JSON not found.
 
-JSON structure (from diagnostics):
-  [{
-    "count": 44,
-    "seeAllEntriesLink": "/Player/.../TimelineEvents/",
-    "timeLineData": [
-      {"date":"May 4, 2023", "year":"2023", "event":"Transfer",
-       "body":"Player transfers to School", "institution":"School", ...},
-      ...
-    ]
-  }]
+JSON event structure:
+  {date, year, event, body, institution, color, img, moreLink, loaded}
+  event types: "Transfer", "Draft", "Enrolled", "Signed", "Commit", "Offer", etc.
+  body is TRUNCATED with "..." — cannot rely on body containing full text like "No. 15"
 
-Note: timeLineData is TRUNCATED (only ~10-15 events). Draft events are often
-not included. Must click "See all" and parse DOM for draft info.
+Draft detection: use evt.event === "Draft" (JSON) or h3 contains ": Draft" (DOM)
 """
 
 import asyncio
@@ -217,7 +210,7 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                             f.write(debug_info)
                         print(f"\n    [Debug] Saved ({len(debug_info)} chars)")
 
-                    # ── Step 1: Parse JSON for portal entry + commit ──
+                    # ── Step 1: Parse JSON for portal entry + commit + draft ──
                     json_dates = await page.evaluate("""
                     (args) => {
                         const classYear = args.classYear;
@@ -228,6 +221,7 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                         let draftTeam = '';
                         let draftPick = '';
                         let method = '';
+                        let jsonTruncated = false;
 
                         const isPortalEvent = (body) =>
                             body.includes('entered the transfer portal') ||
@@ -240,13 +234,11 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                             body.includes('signs with') ||
                             body.includes('enrolls at');
 
-                        const isDraftEvent = (body) =>
-                            body.includes('draft') && body.includes('no.');
-
-                        const parseDraft = (body) => {
+                        const parseDraftFromBody = (body) => {
                             let team = '';
                             let pick = '';
-                            // body: "miami heat draft player with the no. 15 pick..."
+                            // body: "los angeles lakers draft dalton knecht with the..."
+                            // or:   "miami heat draft kel'el ware with the no. 15 pick..."
                             const teamMatch = body.match(/^(.+?)\\s+draft\\s+/i);
                             if (teamMatch) {
                                 team = teamMatch[1].trim()
@@ -261,22 +253,22 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                         if (script) {
                             try {
                                 const raw = JSON.parse(script.textContent);
-                                // Structure: [{count, seeAllEntriesLink, timeLineData: [...]}]
                                 let events = [];
+                                let totalCount = 0;
+
                                 if (Array.isArray(raw) && raw.length > 0 && raw[0].timeLineData) {
                                     events = raw[0].timeLineData;
-                                    method = 'json_timeLineData=' + events.length;
-                                } else if (Array.isArray(raw) && raw.length > 0 && Array.isArray(raw[0])) {
-                                    events = raw[0];
-                                    method = 'json_nested=' + events.length;
-                                } else {
-                                    method = 'json_unknown_structure';
+                                    totalCount = raw[0].count || events.length;
+                                    method = 'json';
                                 }
+
+                                method += '_loaded=' + events.length + '_of_' + totalCount;
+                                jsonTruncated = (totalCount > events.length);
 
                                 // PASS 1: classYear for portal entry + commit
                                 for (const evt of events) {
-                                    if (String(evt.year) !== classYear &&
-                                        !(evt.date || '').includes(classYear)) continue;
+                                    const yr = String(evt.year || '');
+                                    if (yr !== classYear && !(evt.date || '').includes(classYear)) continue;
                                     const body = (evt.body || '').toLowerCase();
                                     if (!portalEntry && isPortalEvent(body))
                                         portalEntry = evt.date || '';
@@ -288,8 +280,8 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                                 // PASS 2: priorYear for portal entry ONLY
                                 if (!portalEntry) {
                                     for (const evt of events) {
-                                        if (String(evt.year) !== priorYear &&
-                                            !(evt.date || '').includes(priorYear)) continue;
+                                        const yr = String(evt.year || '');
+                                        if (yr !== priorYear && !(evt.date || '').includes(priorYear)) continue;
                                         const body = (evt.body || '').toLowerCase();
                                         if (isPortalEvent(body)) {
                                             portalEntry = evt.date || '';
@@ -299,14 +291,14 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                                     }
                                 }
 
-                                // PASS 3: Draft from truncated JSON (any year, most recent first)
+                                // PASS 3: Draft — use evt.event === "Draft" (not body text!)
                                 for (const evt of events) {
-                                    const body = (evt.body || '').toLowerCase();
-                                    if (isDraftEvent(body)) {
+                                    if ((evt.event || '').toLowerCase() === 'draft') {
                                         draftDate = evt.date || '';
-                                        const info = parseDraft(body);
+                                        const info = parseDraftFromBody((evt.body || '').toLowerCase());
                                         draftTeam = info.team;
                                         draftPick = info.pick;
+                                        method += '+json_draft';
                                         break;
                                     }
                                 }
@@ -318,7 +310,10 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                             method = 'no_json';
                         }
 
-                        return { portalEntry, commitDate, draftDate, draftTeam, draftPick, method };
+                        return {
+                            portalEntry, commitDate, draftDate, draftTeam, draftPick,
+                            method, jsonTruncated
+                        };
                     }
                     """, {"classYear": str(class_year), "priorYear": str(class_year - 1)})
 
@@ -328,14 +323,14 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                     player["draftTeam"] = json_dates.get("draftTeam", "")
                     player["draftPick"] = json_dates.get("draftPick", "")
                     method = json_dates.get("method", "")
+                    json_truncated = json_dates.get("jsonTruncated", False)
 
                     # ── Step 2: DOM fallback for anything still missing ──
                     needs_dom = (not player["portalEntryDate"] or
                                  not player["commitDate"] or
-                                 not player["draftDate"])
+                                 (not player["draftDate"] and json_truncated))
 
                     if needs_dom:
-                        # Scroll to trigger timeline lazy-load
                         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                         await page.wait_for_timeout(2000)
 
@@ -345,9 +340,9 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                             await page.evaluate("window.scrollTo(0, 0)")
                             await page.wait_for_timeout(300)
                             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                            await page.wait_for_timeout(2000)
+                            await page.wait_for_timeout(2500)
 
-                        # ALWAYS click "See all" to load full timeline (critical for draft events)
+                        # Click "See all" to expand full timeline
                         try:
                             see_all = page.locator(
                                 "a:has-text('See all'), a:has-text('Load more')"
@@ -375,19 +370,17 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                                 t.includes('transfers to') ||
                                 t.includes('commits to') ||
                                 t.includes('enrolls at');
-                            const isDraftEvent = (t) =>
-                                t.includes('draft') && t.includes('no.');
 
                             const timelineBody = document.querySelector('.timeline-body');
-                            if (!timelineBody) return { portalEntry:'', commitDate:'', draftDate:'', draftTeam:'', draftPick:'' };
+                            if (!timelineBody) return {portalEntry:'',commitDate:'',draftDate:'',draftTeam:'',draftPick:''};
 
                             const yearHeaders = timelineBody.querySelectorAll(':scope > h4');
 
                             const scanYear = (yearText) => {
                                 let pe='', cd='', dd='', dt='', dp='';
-                                for (const h4 of yearHeaders) {
-                                    if (h4.textContent.trim() !== yearText) continue;
-                                    const timeline = h4.nextElementSibling;
+                                for (const yh of yearHeaders) {
+                                    if (yh.textContent.trim() !== yearText) continue;
+                                    const timeline = yh.nextElementSibling;
                                     if (!timeline) continue;
                                     const elems = timeline.querySelectorAll('[class*="vertical-timeline-element"]');
                                     for (const el of elems) {
@@ -396,12 +389,16 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                                         if (!h3 || !h4el) continue;
                                         const h3Text = h3.textContent.trim();
                                         const h4Text = h4el.textContent.trim().toLowerCase();
+
                                         const dateMatch = h3Text.match(/([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4})/);
                                         if (!dateMatch) continue;
                                         const d = dateMatch[1];
+
                                         if (!pe && isPortalEvent(h4Text)) pe = d;
                                         if (!cd && isCommitEvent(h4Text)) cd = d;
-                                        if (!dd && isDraftEvent(h4Text)) {
+
+                                        // Draft: check h3 for ": Draft" event type
+                                        if (!dd && h3Text.toLowerCase().includes(': draft')) {
                                             dd = d;
                                             const tm = h4Text.match(/^(.+?)\\s+draft\\s+/);
                                             if (tm) dt = tm[1].trim().replace(/\\b\\w/g, c => c.toUpperCase());
@@ -414,26 +411,28 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                                 return { pe, cd, dd, dt, dp };
                             };
 
-                            // Portal entry + commit from classYear
+                            // Portal + commit from classYear
                             const r1 = scanYear(classYear);
                             portalEntry = r1.pe;
                             commitDate = r1.cd;
 
-                            // Portal entry fallback from priorYear
+                            // Portal fallback from priorYear
                             if (!portalEntry) {
                                 const r2 = scanYear(priorYear);
                                 portalEntry = r2.pe;
                             }
 
-                            // Draft: scan ALL years (most recent first)
-                            const allYears = Array.from(yearHeaders).map(h => h.textContent.trim());
-                            for (const yr of allYears) {
-                                const r = scanYear(yr);
-                                if (r.dd) {
-                                    draftDate = r.dd;
-                                    draftTeam = r.dt;
-                                    draftPick = r.dp;
-                                    break;
+                            // Draft from ALL years (most recent first)
+                            if (!draftDate) {
+                                const allYears = Array.from(yearHeaders).map(h => h.textContent.trim());
+                                for (const yr of allYears) {
+                                    const r = scanYear(yr);
+                                    if (r.dd) {
+                                        draftDate = r.dd;
+                                        draftTeam = r.dt;
+                                        draftPick = r.dp;
+                                        break;
+                                    }
                                 }
                             }
 
@@ -441,7 +440,6 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                         }
                         """, {"classYear": str(class_year), "priorYear": str(class_year - 1)})
 
-                        # Merge: only fill in what's missing
                         if not player["portalEntryDate"] and dom_dates.get("portalEntry"):
                             player["portalEntryDate"] = dom_dates["portalEntry"]
                             method += "+dom_pe"
@@ -498,7 +496,7 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
         drafted = [f"{p['name']} -> {p['draftTeam']} #{p['draftPick']}" for p in players if p.get("draftDate")]
         if drafted:
             print(f"[QA] Drafted players ({len(drafted)}):")
-            for d in drafted[:15]:
+            for d in drafted[:20]:
                 print(f"  {d}")
 
         # ── CSV ──
