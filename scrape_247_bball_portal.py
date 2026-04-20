@@ -4,6 +4,7 @@ Supports 2023-2026 class years.
 Phase 1: Scroll-load players from rankings page.
 Phase 2: Visit each player profile for portal entry + commit + draft from 247.
 Phase 3: Cross-reference Wikipedia NBA Draft pages to fill/validate draft info.
+         Name matching: full name variants ONLY (no last-name-only fallback).
 """
 
 import asyncio
@@ -34,22 +35,19 @@ def build_name_variants(name):
     variants.add(base.replace('-', ''))
     variants.add(base.replace("'", ""))
     variants.add(base.replace("'", "").replace('-', ''))
+    # First-last without middle names
+    parts = base.split()
+    if len(parts) > 2:
+        variants.add(parts[0] + ' ' + parts[-1])
     return variants
 
 
 def match_player_to_draft(player_name, draft_lookup):
+    """Match ONLY on full name variants. No last-name-only fallback."""
     variants = build_name_variants(player_name)
     for v in variants:
         if v in draft_lookup:
             return draft_lookup[v]
-    # Last name only — only if unique match
-    parts = normalize_name(player_name).split()
-    if len(parts) >= 2:
-        last = parts[-1]
-        last_matches = [info for key, info in draft_lookup.items()
-                       if ' ' in key and key.split()[-1] == last]
-        if len(last_matches) == 1:
-            return last_matches[0]
     return None
 
 
@@ -59,7 +57,6 @@ async def fetch_draft_data(page, draft_year):
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(2000)
-
         players = await page.evaluate("""
         () => {
             const results = [];
@@ -70,7 +67,6 @@ async def fetch_draft_data(page, draft_year):
                 const hasPickCol = headers.some(h => h.includes('pick') || h === '#');
                 const hasPlayerCol = headers.some(h => h.includes('player') || h.includes('name'));
                 if (!hasPickCol || !hasPlayerCol) continue;
-
                 let pickIdx=-1, playerIdx=-1, teamIdx=-1;
                 headers.forEach((h, i) => {
                     if (pickIdx===-1 && (h==='pick' || h==='#' || h==='no.' || h==='no')) pickIdx=i;
@@ -78,7 +74,6 @@ async def fetch_draft_data(page, draft_year):
                     if (teamIdx===-1 && h.includes('team')) teamIdx=i;
                 });
                 if (playerIdx===-1) continue;
-
                 let currentRound = '';
                 let prev = table.previousElementSibling;
                 for (let j=0; j<5 && prev; j++) {
@@ -87,7 +82,6 @@ async def fetch_draft_data(page, draft_year):
                     if (text.includes('second round')) { currentRound='2'; break; }
                     prev = prev.previousElementSibling;
                 }
-
                 for (const row of table.querySelectorAll('tr')) {
                     const cells = row.querySelectorAll('td');
                     if (cells.length < 2) continue;
@@ -124,7 +118,7 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
         )
         page = await context.new_page()
 
-        # ── PHASE 1: Load rankings page ──
+        # ── PHASE 1 ──
         url = f"https://247sports.com/season/{class_year}-basketball/TransferPortalTop/"
         print(f"[Phase 1] Navigating to {url}")
         print(f"[Config] Class year: {class_year}, target: {target_count}")
@@ -142,12 +136,10 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
         for attempt in range(80):
             current_count = await page.evaluate("() => document.querySelectorAll('li.transfer-player').length")
             print(f"  Scroll {attempt+1}: {current_count} transfer-player elements")
-            if current_count >= target_count:
-                print(f"  Reached target ({target_count})"); break
+            if current_count >= target_count: print(f"  Reached target ({target_count})"); break
             if current_count == prev_count:
                 consecutive_no_change += 1
-                if consecutive_no_change >= 10:
-                    print(f"  Stalled at {current_count}"); break
+                if consecutive_no_change >= 10: print(f"  Stalled at {current_count}"); break
             else: consecutive_no_change = 0
             prev_count = current_count
             try:
@@ -207,7 +199,7 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
 
         players = players[:target_count]
 
-        # ── PHASE 2: Visit profiles ──
+        # ── PHASE 2 ──
         print(f"\n[Phase 2] Visiting {len(players)} player profiles...")
         total = len(players)
         save_debug = True
@@ -311,18 +303,25 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
             picks = await fetch_draft_data(page, dy)
             for pk in picks: pk['draft_year'] = dy
             all_picks.extend(picks)
-
         print(f"  Total draft picks loaded: {len(all_picks)}")
 
-        # Build lookup
+        # Build lookup — full name variants only
         draft_lookup = {}
         for dp in all_picks:
             info = {'pick':dp['pick'],'team':dp['team'],'round':dp['round'],
                     'original_name':dp['player'],'draft_year':dp['draft_year']}
             for v in build_name_variants(dp['player']):
-                if len(v) > 2: draft_lookup[v] = info
-
+                if len(v) > 2:
+                    draft_lookup[v] = info
         print(f"  Lookup entries: {len(draft_lookup)}")
+
+        # Debug: print all Wikipedia draft names for verification
+        wiki_names = sorted(set(dp['player'] for dp in all_picks))
+        print(f"  All draft picks ({len(wiki_names)}):")
+        for wn in wiki_names[:10]:
+            print(f"    {wn}")
+        if len(wiki_names) > 10:
+            print(f"    ... and {len(wiki_names)-10} more")
 
         wiki_new = 0; wiki_validated = 0
         for player in players:
@@ -338,8 +337,9 @@ async def scrape_transfer_portal(class_year=2025, target_count=250, output_file=
                     player["draftDate"] = ""
                     wiki_new += 1
                 tag = 'validated' if player.get("draftDate247") else 'NEW'
-                print(f"  [Wiki] #{player['rank']} {player['name']} -> "
-                      f"{match['team']} Rd{match['round']} Pick#{match['pick']} ({tag})")
+                print(f"  [Wiki] #{player['rank']} {player['name']} matched to "
+                      f"{match['original_name']} -> {match['team']} Rd{match['round']} "
+                      f"Pick#{match['pick']} ({tag})")
             else:
                 player["draftDate"] = player.get("draftDate247","")
                 player["draftTeam"] = player.get("draftTeam247","")
